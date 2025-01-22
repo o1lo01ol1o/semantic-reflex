@@ -4,6 +4,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE RecursiveDo #-}
 
 module Reflex.Active
   ( ActiveType
@@ -28,12 +29,17 @@ module Reflex.Active
 import Control.Monad.Fix (MonadFix)
 import Data.Default
 import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Semigroup (Semigroup(..))
 import Data.String (IsString(..))
 
 import qualified Data.Map as M
 
 import Reflex
+import Data.These (These(..))
+import Data.Functor.Misc (Const2(..))
+import Data.Align (Semialign(..))
+import Data.Map.Misc (applyMap)
 
 -- | Kind promoted tag with types 'StaticType' and 'DynamicType'.
 data ActiveType where
@@ -85,6 +91,43 @@ taggedActive f g = \case
   TaggedDynamic a -> g a
 {-# INLINABLE taggedActive #-}
 
+-- | implemented from reflex 8.2.2 so we don't inherit the Eq v constraint from 9 +
+listWithKeyCompat  :: forall t k v m a
+   . (Ord k, Adjustable t m, PostBuild t m, MonadFix m, MonadHold t m)
+  => Dynamic t (Map k v)
+  -> (k -> Dynamic t v -> m a)
+  -> m (Dynamic t (Map k a))
+listWithKeyCompat vals mkChild = do
+  postBuild <- getPostBuild
+  let childValChangedSelector = fanMap $ updated vals
+
+      -- We keep track of changes to children values in the mkChild
+      -- function we pass to listHoldWithKey The other changes we need
+      -- to keep track of are child insertions and
+      -- deletions. diffOnlyKeyChanges keeps track of insertions and
+      -- deletions but ignores value changes, since they're already
+      -- accounted for.
+      diffOnlyKeyChanges olds news =
+        flip Map.mapMaybe (align olds news) $ \case
+          This _    -> Just Nothing
+          These _ _ -> Nothing
+          That new  -> Just $ Just new
+  rec sentVals :: Dynamic t (Map k v) <- foldDyn applyMap Map.empty changeVals
+      let changeVals :: Event t (Map k (Maybe v))
+          changeVals =
+            attachWith diffOnlyKeyChanges (current sentVals) $ leftmost
+              [ updated vals
+
+              -- TODO: This should probably be added to the
+              -- attachWith, not to the updated; if we were using
+              -- diffMap instead of diffMapNoEq, I think it might not
+              -- work
+              , tag (current vals) postBuild
+              ]
+  listHoldWithKey Map.empty changeVals $ \k v ->
+    mkChild k =<< holdDyn v (select childValChangedSelector $ Const2 k)
+
+
 -- | 'listWithKey' for 'Active'. Equivalent to 'M.traverseWithKey' for
 -- 'Static', and 'listWithKey' for 'Dynamic'.
 taggedActiveListWithKey
@@ -96,7 +139,7 @@ taggedActiveListWithKey a f = case a of
   TaggedStatic m -> TaggedStatic <$>
     M.traverseWithKey (\k -> f k . TaggedStatic) m
   TaggedDynamic m -> TaggedDynamic <$>
-    listWithKey m (\k -> f k . TaggedDynamic)
+    listWithKeyCompat m (\k -> f k . TaggedDynamic)
 
 -- | Create a dynamically-changing set of widgets, one of which is selected at
 -- any time.
